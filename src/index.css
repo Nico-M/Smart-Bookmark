@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --border-radius: 6px;
+  --box-shadow-x: 4px;
+  --box-shadow-y: 4px;
+  --reverse-box-shadow-x: -4px;
+  --reverse-box-shadow-y: -4px;
+  --heading-font-weight: 700;
+  --base-font-weight: 500;
+  --background: #f5f7ff;
+  --secondary-background: #ffffff;
+  --foreground: #101010;
+  --main-foreground: #0f0f0f;
+  --main: #7aa2ff;
+  --border: #101010;
+  --ring: #101010;
+  --overlay: rgba(0, 0, 0, 0.8);
+  --shadow: var(--box-shadow-x) var(--box-shadow-y) 0px 0px var(--border);
+}
+
+.dark {
+  --background: #2b334b;
+  --secondary-background: #1f2433;
+  --foreground: #f6f7fb;
+  --main-foreground: #0f0f0f;
+  --main: #c4d5ff;
+  --border: #0f0f0f;
+  --ring: #f6f7fb;
+  --overlay: rgba(0, 0, 0, 0.8);
+  --shadow: var(--box-shadow-x) var(--box-shadow-y) 0px 0px var(--border);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-base antialiased;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    @apply font-heading;
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2022",
+    "outDir": ".test-dist",
+    "rootDir": ".",
+    "noEmit": false,
+    "declaration": false,
+    "sourceMap": false,
+    "types": ["node"]
+  },
+  "include": [
+    "tests/**/*.ts",
+    "src/background/utils/url-normalizer.ts",
+    "src/background/utils/dedup.ts",
+    "src/shared/grouping-rules.ts",
+    "src/shared/schemas.ts",
+    "src/shared/types.ts"
+  ]
+}
