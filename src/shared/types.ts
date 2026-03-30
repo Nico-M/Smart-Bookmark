@@ -24,14 +24,26 @@ export type GroupPlan = {
   reason?: string;
 };
 
+export type ExcludeReason = "本地文件" | "本地服务" | "内网地址" | "测试环境";
+
+export type ExcludedBookmark = {
+  id: string;
+  title: string;
+  url: string;
+  reason: ExcludeReason;
+  suggestedGroupPath: string[];
+};
+
 export type OrganizePreview = {
   generatedAt: number;
   totalCount: number;
   uniqueCount: number;
   duplicateCount: number;
+  excludedCount: number;
   estimatedMoveCount: number;
   groups: GroupPlan[];
   duplicateIds: string[];
+  excludedItems: ExcludedBookmark[];
   source: "ai";
 };
 

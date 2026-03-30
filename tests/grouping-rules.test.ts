@@ -4,18 +4,7 @@ import {
   inferGroupPathFromBookmark,
   normalizeGroupPathWithTaxonomy
 } from "../src/shared/grouping-rules.js";
-import type { BookmarkItem } from "../src/shared/types.js";
-
-function createBookmark(overrides: Partial<BookmarkItem>): BookmarkItem {
-  return {
-    id: "1",
-    title: "",
-    url: "https://example.com",
-    parentId: "0",
-    path: [],
-    ...overrides
-  };
-}
+import { createBookmark } from "./evaluation-fixtures.js";
 
 test("normalizeGroupPathWithTaxonomy: 技术旧别名会归并到稳定分类", () => {
   const bookmark = createBookmark({
@@ -103,6 +92,28 @@ test("normalizeGroupPathWithTaxonomy: 工具目录的错误层级会被拉直到
   const groupPath = normalizeGroupPathWithTaxonomy(["工具", "在线工具", "软件下载"], bookmark);
 
   assert.deepEqual(groupPath, ["工具", "软件资源"]);
+});
+
+test("normalizeGroupPathWithTaxonomy: 开发工具三级分类会归并到稳定词表", () => {
+  const bookmark = createBookmark({
+    title: "Git - Book",
+    url: "https://www.git-scm.com/book/zh/v2"
+  });
+
+  const groupPath = normalizeGroupPathWithTaxonomy(["技术", "开发工具", "git教程"], bookmark);
+
+  assert.deepEqual(groupPath, ["技术", "开发工具", "版本控制"]);
+});
+
+test("normalizeGroupPathWithTaxonomy: AI 平台三级分类会归并到 API 服务", () => {
+  const bookmark = createBookmark({
+    title: "OpenAI API Platform",
+    url: "https://platform.openai.com/"
+  });
+
+  const groupPath = normalizeGroupPathWithTaxonomy(["AI", "编程与平台", "控制台"], bookmark);
+
+  assert.deepEqual(groupPath, ["AI", "编程与平台", "API 服务"]);
 });
 
 test("inferGroupPathFromBookmark: 兜底分类与主分类口径一致", () => {

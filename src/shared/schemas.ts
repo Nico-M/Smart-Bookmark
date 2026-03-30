@@ -30,8 +30,30 @@ export const groupPlanSchema = rawGroupPlanSchema.transform((value) => {
   };
 });
 
+const facetSchema = z.object({
+  id: z.string().min(1),
+  primary_topic: z.string().min(1),
+  resource_type: z.string().min(1),
+  source_type: z.string().min(1),
+  usage_intent: z.string().min(1),
+  scope: z.string().min(1),
+  confidence: z.number().min(0).max(1).optional()
+});
+
 export const aiOutputSchema = z.object({
-  groups: z.array(groupPlanSchema)
+  groups: z.array(groupPlanSchema),
+  facets: z.array(facetSchema).optional()
+});
+
+export const aiGroupReviewOutputSchema = z.object({
+  groups: z.array(
+    z.object({
+      groupPath: z.array(z.string().min(1)).min(1),
+      groupIds: z.array(z.string().min(1)).min(1),
+      reason: z.string().optional()
+    })
+  )
 });
 
 export type AiOutput = z.infer<typeof aiOutputSchema>;
+export type AiGroupReviewOutput = z.infer<typeof aiGroupReviewOutputSchema>;

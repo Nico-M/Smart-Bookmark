@@ -1,4 +1,4 @@
-import { aiOutputSchema } from "@/shared/schemas";
+import { aiGroupReviewOutputSchema, aiOutputSchema } from "@/shared/schemas";
 import {
   FALLBACK_CHILD_NAME,
   FALLBACK_TOP_LEVEL_NAME,
@@ -7,27 +7,30 @@ import {
   inferGroupPathFromBookmark,
   normalizeGroupPathWithTaxonomy
 } from "@/shared/grouping-rules";
+import {
+  FACET_OPTIONS,
+  FORBIDDEN_GROUP_NAME_PATTERNS,
+  FORBIDDEN_GROUP_NAMES,
+  SECOND_LEVEL_GROUP_OPTIONS,
+  THIRD_LEVEL_GROUP_OPTIONS
+} from "@/shared/taxonomy";
+import { buildGroupReviewCandidates, splitIntoFixedBatches } from "@/shared/group-review";
+import {
+  formatPathForPrompt,
+  normalizeUrlForPrompt,
+  truncatePromptText
+} from "@/shared/prompt-compression";
 import type { AppConfig, BookmarkItem, GroupPlan } from "@/shared/types";
 import { ServiceError } from "../utils/service-error";
 import { appendErrorLog } from "../utils/logger";
 
 const AI_RETRY_COUNT = 2;
 const MAX_AUTO_SPLIT_DEPTH = 12;
-const AI_BATCH_MAX_ITEMS = 120;
-const AI_BATCH_MAX_PAYLOAD_BYTES = 48 * 1024;
+const AI_FIRST_PASS_BATCH_SIZE = 300;
+const AI_FIRST_PASS_CONCURRENCY = 3;
 const AI_DEBUG_PRINT_ONLY = false;
-const AI_DISABLE_CHUNKING = true;
-const FORBIDDEN_GROUP_NAME_PATTERNS = [
-  /未分类/,
-  /未分组/,
-  /待分类/,
-  /^uncategorized$/i,
-  /^unclassified$/i,
-  /^ungrouped$/i,
-  /^unknown$/i,
-  /^n\/a$/i,
-  /^none$/i
-];
+const AI_INCLUDE_FACETS = false;
+const AI_REVIEW_SAMPLE_TITLE_LIMIT = 3;
 const NON_RETRYABLE_AI_ERROR_CODES = new Set<string>([
   "AI_AUTH_INVALID",
   "AI_EMPTY_RESPONSE",
@@ -37,6 +40,7 @@ const NON_RETRYABLE_AI_ERROR_CODES = new Set<string>([
   "AI_INPUT_TOO_LARGE"
 ]);
 const TOP_LEVEL_GROUP_OPTIONS_TEXT = TOP_LEVEL_GROUPS.join("、");
+const FORBIDDEN_GROUP_NAMES_TEXT = FORBIDDEN_GROUP_NAMES.join("、");
 
 type GroupBucket = { groupPath: string[]; bookmarkIds: string[]; reason?: string };
 type GroupBucketMap = Map<string, GroupBucket>;
@@ -49,15 +53,43 @@ type PromptBookmark = {
 type PromptPayload = {
   task: "group_bookmarks";
   instruction: string[];
-  topLevelOptions: typeof TOP_LEVEL_GROUPS;
-  batchNo: number;
-  batchTotal: number;
+  facetSchema: {
+    primary_topic: string;
+    resource_type: string[];
+    source_type: string[];
+    usage_intent: string[];
+    scope: string[];
+  };
+  taxonomy: {
+    topLevel: typeof TOP_LEVEL_GROUPS;
+    secondLevelByTop: typeof SECOND_LEVEL_GROUP_OPTIONS;
+    thirdLevelBySecond: typeof THIRD_LEVEL_GROUP_OPTIONS;
+    forbiddenGroupNames: typeof FORBIDDEN_GROUP_NAMES;
+  };
   pathDict: string[];
   bookmarks: PromptBookmark[];
+};
+type GroupReviewPromptGroup = {
+  id: string;
+  groupPath: string[];
+  count: number;
+  sampleTitles: string[];
+};
+type GroupReviewPromptPayload = {
+  task: "review_group_names";
+  instruction: string[];
+  taxonomy: {
+    topLevel: typeof TOP_LEVEL_GROUPS;
+    secondLevelByTop: typeof SECOND_LEVEL_GROUP_OPTIONS;
+    thirdLevelBySecond: typeof THIRD_LEVEL_GROUP_OPTIONS;
+    forbiddenGroupNames: typeof FORBIDDEN_GROUP_NAMES;
+  };
+  groups: GroupReviewPromptGroup[];
 };
 
 type ChatCompletionResponse = {
   choices?: Array<{
+    finish_reason?: string;
     message?: {
       content?: unknown;
     };
@@ -81,22 +113,44 @@ export async function classifyWithAi(
     return buildDebugGroupPlans(bookmarks);
   }
 
+  const bookmarkById = new Map(bookmarks.map((item) => [item.id, item] as const));
   const grouped: GroupBucketMap = new Map();
-  const batches = AI_DISABLE_CHUNKING ? [bookmarks] : splitBatchesForAi(bookmarks);
-  const total = batches.length;
-  for (let index = 0; index < total; index += 1) {
-    const batchNo = index + 1;
-    await classifyAndMergeWithAutoSplit({
-      batch: batches[index],
-      config,
-      grouped,
-      batchNo,
-      batchTotal: total,
-      splitDepth: 0
-    });
-  }
+  const batches = splitBatchesForAi(bookmarks);
+  await classifyFirstPassBatches(batches, config, grouped);
 
-  return finalizeGroupPlans(grouped);
+  const firstPassGroups = finalizeGroupPlans(grouped);
+  return reviewGroupPlansWithAi(firstPassGroups, bookmarkById, config);
+}
+
+/**
+ * 第一阶段按受限并发执行，兼顾速度与 provider 限流风险。
+ */
+async function classifyFirstPassBatches(
+  batches: BookmarkItem[][],
+  config: AppConfig,
+  grouped: GroupBucketMap
+): Promise<void> {
+  const total = batches.length;
+  let nextIndex = 0;
+  const workerCount = Math.min(AI_FIRST_PASS_CONCURRENCY, total);
+
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (nextIndex < total) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+
+      await classifyAndMergeWithAutoSplit({
+        batch: batches[currentIndex],
+        config,
+        grouped,
+        batchNo: currentIndex + 1,
+        batchTotal: total,
+        splitDepth: 0
+      });
+    }
+  });
+
+  await Promise.all(workers);
 }
 
 /**
@@ -154,33 +208,10 @@ async function classifyAndMergeWithAutoSplit(input: {
 }
 
 /**
- * 常态分批：同时限制条数与估算 payload 体积，避免单次样本过大。
+ * 第一阶段按固定条数分批，优先控制输出体积；若单批仍超限，再自动二分降载。
  */
 function splitBatchesForAi(bookmarks: BookmarkItem[]): BookmarkItem[][] {
-  const batches: BookmarkItem[][] = [];
-  let current: BookmarkItem[] = [];
-
-  for (const item of bookmarks) {
-    // 按整批压缩后的真实载荷预估大小，避免路径字典等共享结构被低估。
-    const trialBatch = [...current, item];
-    const trialPayload = buildPromptPayload(trialBatch, 1, 1);
-    const trialBytes = estimatePromptPayloadBytes(trialPayload);
-    const exceedCount = current.length >= AI_BATCH_MAX_ITEMS;
-    const exceedBytes = current.length > 0 && trialBytes > AI_BATCH_MAX_PAYLOAD_BYTES;
-
-    if (exceedCount || exceedBytes) {
-      batches.push(current);
-      current = [];
-    }
-
-    current.push(item);
-  }
-
-  if (current.length > 0) {
-    batches.push(current);
-  }
-
-  return batches.length > 0 ? batches : [bookmarks];
+  return splitIntoFixedBatches(bookmarks, AI_FIRST_PASS_BATCH_SIZE);
 }
 
 /**
@@ -196,7 +227,7 @@ async function classifyBatchWithRetry(
 
   for (let attempt = 0; attempt <= AI_RETRY_COUNT; attempt += 1) {
     try {
-      return await classifyBatchOnce(batch, config, batchNo, batchTotal);
+      return await classifyBatchOnce(batch, config);
     } catch (error) {
       const normalized = normalizeAiError(error);
       lastError = normalized;
@@ -231,12 +262,10 @@ async function classifyBatchWithRetry(
  */
 async function classifyBatchOnce(
   batch: BookmarkItem[],
-  config: AppConfig,
-  batchNo: number,
-  batchTotal: number
+  config: AppConfig
 ) {
   const url = toChatCompletionsUrl(config.baseUrl);
-  const body = buildChatCompletionBody(batch, config.model, batchNo, batchTotal);
+  const body = buildChatCompletionBody(batch, config.model);
 
   try {
     const response = await fetch(url, {
@@ -275,6 +304,7 @@ async function classifyBatchOnce(
     }
 
     const payload = (await response.json()) as ChatCompletionResponse;
+    ensureResponseNotTruncated(payload);
     const content = extractMessageContent(payload);
     if (!content || !content.trim()) {
       throw new ServiceError(
@@ -316,15 +346,84 @@ async function classifyBatchOnce(
 }
 
 /**
+ * 第二阶段只复检分组命名与重复问题，不再回到书签粒度重分配。
+ */
+async function reviewGroupPlansWithAi(
+  groups: GroupPlan[],
+  bookmarkById: ReadonlyMap<string, BookmarkItem>,
+  config: AppConfig
+): Promise<GroupPlan[]> {
+  if (groups.length <= 1) {
+    return groups;
+  }
+
+  const reviewCandidates = buildGroupReviewCandidates(
+    groups,
+    bookmarkById,
+    AI_REVIEW_SAMPLE_TITLE_LIMIT
+  );
+  const url = toChatCompletionsUrl(config.baseUrl);
+  const body = buildGroupReviewCompletionBody(reviewCandidates, config.model);
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`
+      },
+      body: JSON.stringify(body)
+    });
+    const errorDetail = response.ok ? "" : await readErrorDetail(response);
+
+    if (response.status === 401) {
+      throw new ServiceError("AI_AUTH_INVALID", "API Key 无效或已过期。");
+    }
+    if (response.status === 429) {
+      throw new ServiceError("AI_RATE_LIMIT", "请求频率过高，请稍后重试。", true);
+    }
+    if (response.status >= 500) {
+      throw new ServiceError(
+        "AI_SERVER_ERROR",
+        `AI 服务暂时不可用（${response.status}）。`,
+        true
+      );
+    }
+    if (isLikelyInputTooLarge(response.status, errorDetail)) {
+      throw new ServiceError("AI_INPUT_TOO_LARGE", "分组复检请求过大，请缩小整理范围后重试。", false);
+    }
+    if (!response.ok) {
+      throw new ServiceError(
+        "AI_HTTP_ERROR",
+        buildHttpErrorMessage(response.status, errorDetail),
+        response.status === 408
+      );
+    }
+
+    const payload = (await response.json()) as ChatCompletionResponse;
+    ensureResponseNotTruncated(payload);
+    const content = extractMessageContent(payload);
+    if (!content || !content.trim()) {
+      throw new ServiceError("AI_EMPTY_RESPONSE", "AI 分组复检返回为空。", false);
+    }
+
+    const parsed = aiGroupReviewOutputSchema.parse(JSON.parse(stripCodeBlock(content)));
+    return applyReviewedGroups(groups, parsed.groups, bookmarkById);
+  } catch (error) {
+    const normalized = normalizeAiError(error);
+    await traceReviewFallback(normalized.message);
+    return groups;
+  }
+}
+
+/**
  * 构造发往 AI 的完整请求体，便于调试打印与正式请求复用同一份结构。
  */
 function buildChatCompletionBody(
   batch: BookmarkItem[],
-  model: string,
-  batchNo: number,
-  batchTotal: number
+  model: string
 ) {
-  const promptPayload = buildPromptPayload(batch, batchNo, batchTotal);
+  const promptPayload = buildPromptPayload(batch);
 
   return {
     model,
@@ -334,7 +433,34 @@ function buildChatCompletionBody(
       {
         role: "system",
         content:
-          "你是书签整理助手。请把输入书签按主题分组，并给出简洁中文分组名。必须基于站点信息完成分类，禁止输出未分类。输出必须是 JSON，不允许额外文本。"
+          "You are an information-architecture-driven bookmark classifier. You must first identify the semantic facets of bookmarks, then map them to the controlled taxonomy. The folder tree should be organized primarily by topic. Output must be valid JSON only, with no extra text."
+      },
+      {
+        role: "user",
+        content: JSON.stringify(promptPayload)
+      }
+    ]
+  };
+}
+
+/**
+ * 构造第二阶段“组名复检”请求体，只讨论组路径，不再发送 URL。
+ */
+function buildGroupReviewCompletionBody(
+  groups: GroupReviewPromptGroup[],
+  model: string
+) {
+  const promptPayload = buildGroupReviewPromptPayload(groups);
+
+  return {
+    model,
+    temperature: 0.1,
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are a taxonomy reviewer for bookmark groups. Review only group names and duplicate group structures. Do not reclassify individual bookmarks. Output valid JSON only."
       },
       {
         role: "user",
@@ -348,9 +474,7 @@ function buildChatCompletionBody(
  * 构造发给 AI 的紧凑提示词载荷，压缩重复路径并只保留分类所需字段。
  */
 function buildPromptPayload(
-  batch: BookmarkItem[],
-  batchNo: number,
-  batchTotal: number
+  batch: BookmarkItem[]
 ): PromptPayload {
   const pathDict: string[] = [];
   const pathIndexMap = new Map<string, number>();
@@ -358,34 +482,72 @@ function buildPromptPayload(
   return {
     task: "group_bookmarks",
     instruction: [
-      "将每条书签分配到一个分组路径。",
-      "groupPath 为 1~3 级的字符串数组，例如 [\"技术\", \"前端\", \"React\"]。",
-      `一级分类必须且只能从以下集合中选择：${TOP_LEVEL_GROUP_OPTIONS_TEXT}。`,
-      "每一级名称不超过12个中文字符。",
-      "禁止使用“未分类/未分组/uncategorized/ungrouped”等兜底名称。",
-      "“其他主题”只能在完全无法判断主题时使用；只要能根据标题、URL 或路径判断，就不要使用“其他主题”。",
-      "一级分类必须按主题归类，不要按站点形态、内容载体或工具形态命名。",
-      "bookmarks[*].pathIndex 对应 pathDict 中同下标的路径文本，请结合 title、url、pathDict[pathIndex] 一起判断。",
-      "URL 已去掉 query 和 hash，只保留 host 与 pathname；请不要依赖追踪参数做分类。",
-      "技术相关内容统一放入“技术”，禁止输出“技术开发/技术社区/技术资源/前端开发/前端框架/核心技术/开发工具/资源导航”等作为一级分类。",
-      "AI 相关内容统一放入“AI”，禁止输出“AI与Python/AI 与 数字化/AI工具”等作为一级分类。",
-      "工具相关内容统一放入“工具”，禁止输出“个人工具/网络工具/效率工具”等作为一级分类。",
-      "影音相关内容统一放入“影音”，禁止输出“影视娱乐”作为一级分类。",
-      "公司内部系统、业务平台统一放入“工作”，禁止输出“公司业务”作为一级分类。",
-      "工具类资源统一放入“工具”；设计素材统一放入“设计”；课程文档统一放入“学习”；资讯媒体统一放入“资讯”。",
-      "二级分类再做细分，例如 [\"技术\", \"前端开发\"]、[\"技术\", \"社区博客\"]、[\"AI\", \"编程与平台\"]、[\"AI\", \"创作与提示词\"]。",
-      "必须根据 title、url、pathDict[pathIndex] 进行判定，不允许空分组。",
-      "一级分类数量尽量收敛，最多 10 个。",
-      "语义相近的分组必须使用同一个名称，不能在不同批次里换同义词。",
-      "必须使用输入中的 bookmarkIds，不能杜撰 ID。",
-      "不要输出 reason 或任何解释文本，只返回分组结果。",
-      "输出结构: { groups: [{ groupPath, bookmarkIds }] }。"
+      "Task: output stable group paths organized by topic, not by site name or resource format.",
+      "Make an internal semantic judgment first, then decide groupPath. Do not classify directly from the original folder names.",
+      "Return only non-empty groups. Omit facets by default; include facets only for a few genuinely ambiguous items if absolutely necessary.",
+      "groupPath must be a 1-3 level string array, for example [\"技术\", \"前端开发\", \"React\"].",
+      `The top-level category must be chosen only from: ${TOP_LEVEL_GROUP_OPTIONS_TEXT}.`,
+      "Second-level and third-level categories must come from the taxonomy whitelist. Do not invent new category names or switch to synonyms.",
+      `Do not use any fallback or dirty category names such as: ${FORBIDDEN_GROUP_NAMES_TEXT}.`,
+      "The folder tree should be organized by topic only. Do not mix resource type, source type, or access scope into the same hierarchy level as topic.",
+      "Systematic learning resources such as courses, books, and bootcamps should prefer “学习”. Official docs, blog posts, community posts, and daily reference materials should prefer “技术”.",
+      "Tool resources go to “工具”. Design assets go to “设计”. News and media go to “资讯”. Internal systems and business platforms go to “工作”.",
+      "bookmarks[*].pathIndex refers to pathDict[pathIndex]. Use title, url, and path together when making decisions.",
+      "url is only a compressed site summary without query or hash. Do not rely on tracking parameters.",
+      "If a link is clearly localhost, file://, a private-network IP, or a test-environment domain, do not mix it into public topic groups. If you output facets, scope should be “本地”, “内网”, or “测试环境” accordingly.",
+      "Use “其他主题” only when the topic is truly impossible to determine.",
+      "You must use bookmarkIds from the input. Do not fabricate IDs.",
+      "Do not output explanatory prose. Return JSON only.",
+      AI_INCLUDE_FACETS
+        ? "Output shape: { groups: [{ groupPath, bookmarkIds }], facets?: [{ id, primary_topic, resource_type, source_type, usage_intent, scope, confidence? }] }."
+        : "Output shape: { groups: [{ groupPath, bookmarkIds }] }. Do not output facets by default."
     ],
-    topLevelOptions: TOP_LEVEL_GROUPS,
-    batchNo,
-    batchTotal,
+    facetSchema: {
+      primary_topic: "Content topic. It must be a short and clear Chinese phrase.",
+      resource_type: FACET_OPTIONS.resourceTypes,
+      source_type: FACET_OPTIONS.sourceTypes,
+      usage_intent: FACET_OPTIONS.usageIntents,
+      scope: FACET_OPTIONS.scopes
+    },
+    taxonomy: {
+      topLevel: TOP_LEVEL_GROUPS,
+      secondLevelByTop: SECOND_LEVEL_GROUP_OPTIONS,
+      thirdLevelBySecond: THIRD_LEVEL_GROUP_OPTIONS,
+      forbiddenGroupNames: FORBIDDEN_GROUP_NAMES
+    },
     pathDict,
     bookmarks: batch.map((item) => toPromptBookmark(item, pathDict, pathIndexMap))
+  };
+}
+
+/**
+ * 第二阶段提示词只讨论分组命名是否重复、是否需要整组合并或重命名。
+ */
+function buildGroupReviewPromptPayload(groups: GroupReviewPromptGroup[]): GroupReviewPromptPayload {
+  return {
+    task: "review_group_names",
+    instruction: [
+      "Task: review group names and duplicate groups after the first-pass bookmark classification.",
+      "This is a group-level review pass only. Do not reclassify individual bookmarks.",
+      "Each input group has an id, a current groupPath, a bookmark count, and a few sample titles.",
+      "You may keep a group as-is, rename its groupPath, or merge multiple input groups into one output group.",
+      "If you merge groups, return one output item whose groupIds contains all merged input group ids.",
+      "Never split one input group into multiple output groups.",
+      "Do not use URLs, hostnames, or site-specific labels. Focus on taxonomy consistency and duplicate naming.",
+      `The top-level category must stay within: ${TOP_LEVEL_GROUP_OPTIONS_TEXT}.`,
+      "Second-level and third-level names must come from the taxonomy whitelist. Do not invent new names.",
+      `Do not use fallback or dirty names such as: ${FORBIDDEN_GROUP_NAMES_TEXT}.`,
+      "Use Chinese taxonomy names in groupPath.",
+      "Return only non-empty groups and only valid input groupIds.",
+      "Output shape: { groups: [{ groupPath, groupIds, reason? }] }."
+    ],
+    taxonomy: {
+      topLevel: TOP_LEVEL_GROUPS,
+      secondLevelByTop: SECOND_LEVEL_GROUP_OPTIONS,
+      thirdLevelBySecond: THIRD_LEVEL_GROUP_OPTIONS,
+      forbiddenGroupNames: FORBIDDEN_GROUP_NAMES
+    },
+    groups
   };
 }
 
@@ -393,11 +555,10 @@ function buildPromptPayload(
  * 调试模式下打印整批完整请求体，便于核对重复标签与真实 payload。
  */
 async function traceDebugRequest(bookmarks: BookmarkItem[], config: AppConfig): Promise<void> {
-  const body = buildChatCompletionBody(bookmarks, config.model, 1, 1);
+  const body = buildChatCompletionBody(bookmarks, config.model);
   const payloadBytes = encodeUtf8ByteLength(JSON.stringify(body));
 
-  console.info(`[AI][debug] print-only mode enabled, size=${payloadBytes} bytes, count=${bookmarks.length}`);
-  console.log("[AI][debug] request body JSON:\n%s", JSON.stringify(body, null, 2));
+  console.log(JSON.stringify(body, null, 2));
 
   try {
     await appendErrorLog({
@@ -445,7 +606,7 @@ function toPromptBookmark(
 ): PromptBookmark {
   return {
     id: item.id,
-    title: truncateText(item.title || "(无标题)", 96),
+    title: truncatePromptText(item.title || "(无标题)", 72),
     url: normalizeUrlForPrompt(item.url),
     pathIndex: internPromptPath(item.path, pathDict, pathIndexMap)
   };
@@ -472,13 +633,6 @@ function internPromptPath(
 }
 
 /**
- * 估算压缩后提示词载荷字节数，用于分批前预估请求体积。
- */
-function estimatePromptPayloadBytes(payload: PromptPayload): number {
-  return encodeUtf8ByteLength(JSON.stringify(payload));
-}
-
-/**
  * 计算 UTF-8 字节长度。
  */
 function encodeUtf8ByteLength(input: string): number {
@@ -486,34 +640,7 @@ function encodeUtf8ByteLength(input: string): number {
 }
 
 /**
- * 规范化 URL 用于提示词：去协议、去 query/hash、限长。
- */
-function normalizeUrlForPrompt(rawUrl: string): string {
-  const trimmed = rawUrl.trim();
-  try {
-    const url = new URL(trimmed);
-    const normalized = `${url.host}${url.pathname}`;
-    return truncateText(normalized, 220);
-  } catch {
-    const normalized = trimmed.split(/[?#]/, 1)[0] || trimmed;
-    return truncateText(normalized, 220);
-  }
-}
-
-/**
- * 路径仅保留最后 3 级并限制总长度。
- */
-function formatPathForPrompt(path: string[]): string {
-  const compact = path
-    .slice(-3)
-    .map((segment) => truncateText(segment.trim(), 20))
-    .filter((segment) => segment.length > 0)
-    .join(" / ");
-  return truncateText(compact, 120);
-}
-
-/**
- * 文本限长，避免单条样本过长拖垮上下文。
+ * 通用文本限长：用于日志、错误详情等非提示词正文场景。
  */
 function truncateText(input: string, maxLength: number): string {
   const text = input.trim();
@@ -650,6 +777,88 @@ function extractMessageContent(payload: ChatCompletionResponse): string {
     }
   }
   return "";
+}
+
+/**
+ * 一旦模型返回被截断，直接触发重试或自动降载，避免吃半截 JSON。
+ */
+function ensureResponseNotTruncated(payload: ChatCompletionResponse): void {
+  const finishReason = payload.choices?.[0]?.finish_reason;
+  if (finishReason !== "length") {
+    return;
+  }
+
+  throw new ServiceError(
+    "AI_RESPONSE_TRUNCATED",
+    "AI 返回被截断（finish_reason=length），将缩小批次后重试。",
+    true
+  );
+}
+
+/**
+ * 将第二阶段组名复检结果映射回真实书签分组；若部分组未被引用，则保留原分组。
+ */
+function applyReviewedGroups(
+  originalGroups: GroupPlan[],
+  reviewedGroups: Array<{ groupPath: string[]; groupIds: string[]; reason?: string }>,
+  bookmarkById: ReadonlyMap<string, BookmarkItem>
+): GroupPlan[] {
+  const grouped: GroupBucketMap = new Map();
+  const groupById = new Map<string, GroupPlan>(
+    originalGroups.map((group, index) => [`g${index + 1}`, group])
+  );
+  const assignedGroupIds = new Set<string>();
+
+  for (const reviewedGroup of reviewedGroups) {
+    const sourceGroups = reviewedGroup.groupIds
+      .map((groupId) => groupById.get(groupId))
+      .filter((group): group is GroupPlan => Boolean(group));
+    if (sourceGroups.length === 0) {
+      continue;
+    }
+
+    const sampleBookmarkId = sourceGroups.flatMap((group) => group.bookmarkIds)[0];
+    const sampleBookmark = sampleBookmarkId ? bookmarkById.get(sampleBookmarkId) : undefined;
+    const normalizedGroupPath = normalizeGroupPath(reviewedGroup.groupPath, sampleBookmark);
+    const key = encodeGroupPath(normalizedGroupPath);
+    const bucket = grouped.get(key) ?? {
+      groupPath: normalizedGroupPath,
+      bookmarkIds: [],
+      reason: reviewedGroup.reason
+    };
+
+    for (const groupId of reviewedGroup.groupIds) {
+      const sourceGroup = groupById.get(groupId);
+      if (!sourceGroup || assignedGroupIds.has(groupId)) {
+        continue;
+      }
+      bucket.bookmarkIds.push(...sourceGroup.bookmarkIds);
+      bucket.reason ??= reviewedGroup.reason ?? sourceGroup.reason;
+      assignedGroupIds.add(groupId);
+    }
+
+    grouped.set(key, bucket);
+  }
+
+  for (let index = 0; index < originalGroups.length; index += 1) {
+    const groupId = `g${index + 1}`;
+    if (assignedGroupIds.has(groupId)) {
+      continue;
+    }
+
+    const group = originalGroups[index];
+    const key = encodeGroupPath(group.groupPath);
+    const bucket = grouped.get(key) ?? {
+      groupPath: [...group.groupPath],
+      bookmarkIds: [],
+      reason: group.reason
+    };
+    bucket.bookmarkIds.push(...group.bookmarkIds);
+    bucket.reason ??= group.reason;
+    grouped.set(key, bucket);
+  }
+
+  return finalizeGroupPlans(grouped);
 }
 
 /**
@@ -819,10 +1028,10 @@ function normalizeAiError(error: unknown): ServiceError {
  * 判断错误是否可以触发自动拆分降载。
  */
 function shouldAutoSplit(error: ServiceError, batchSize: number): boolean {
-  if (AI_DISABLE_CHUNKING) {
-    return false;
-  }
-  return error.code === "AI_INPUT_TOO_LARGE" && batchSize > 1;
+  return (
+    (error.code === "AI_INPUT_TOO_LARGE" || error.code === "AI_RESPONSE_TRUNCATED") &&
+    batchSize > 1
+  );
 }
 
 /**
@@ -885,6 +1094,22 @@ async function traceRetryDecision(input: {
         retryable: input.retryable,
         shouldRetry: input.shouldRetry
       }
+    });
+  } catch {
+    // 日志写入失败不影响主流程
+  }
+}
+
+/**
+ * 第二阶段复检失败时记录日志，并回退到第一阶段结果。
+ */
+async function traceReviewFallback(message: string): Promise<void> {
+  console.info(`[AI] review-pass fallback: ${message}`);
+  try {
+    await appendErrorLog({
+      command: "organize.preview.generate",
+      errorCode: "AI_TRACE_REVIEW_FALLBACK",
+      message: truncateText(message, 180)
     });
   } catch {
     // 日志写入失败不影响主流程

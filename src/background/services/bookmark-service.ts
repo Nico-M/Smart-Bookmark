@@ -396,6 +396,7 @@ type PreviewConsistencySummary = {
   uniqueCount: number;
   duplicateCount: number;
   filteredCount: number;
+  excludedCount: number;
 };
 
 /**
@@ -442,6 +443,24 @@ export function validatePreviewConsistency(
     duplicateIds.add(duplicateId);
   }
 
+  const excludedIds = new Set<string>();
+  for (const item of preview.excludedItems) {
+    const excludedId = item.id.trim();
+    if (!excludedId) {
+      throw new ServiceError(
+        "PREVIEW_INVALID_EXCLUDED_ID",
+        "预览中存在空的排除书签 ID，请重新生成预览。"
+      );
+    }
+    if (excludedIds.has(excludedId)) {
+      throw new ServiceError(
+        "PREVIEW_EXCLUDED_LIST_CONFLICT",
+        `排除列表中存在重复 ID（${excludedId}），请重新生成预览。`
+      );
+    }
+    excludedIds.add(excludedId);
+  }
+
   for (const id of groupedBookmarkIds) {
     if (duplicateIds.has(id)) {
       throw new ServiceError(
@@ -449,11 +468,27 @@ export function validatePreviewConsistency(
         `书签 ${id} 同时出现在“保留分组”和“重复列表”中，请重新生成预览。`
       );
     }
+    if (excludedIds.has(id)) {
+      throw new ServiceError(
+        "PREVIEW_GROUP_EXCLUDED_OVERLAP",
+        `书签 ${id} 同时出现在“保留分组”和“排除列表”中，请重新生成预览。`
+      );
+    }
+  }
+
+  for (const id of duplicateIds) {
+    if (excludedIds.has(id)) {
+      throw new ServiceError(
+        "PREVIEW_DUPLICATE_EXCLUDED_OVERLAP",
+        `书签 ${id} 同时出现在“重复列表”和“排除列表”中，请重新生成预览。`
+      );
+    }
   }
 
   const uniqueCount = groupedBookmarkIds.size;
   const duplicateCount = duplicateIds.size;
-  const totalCount = uniqueCount + duplicateCount;
+  const excludedCount = excludedIds.size;
+  const totalCount = uniqueCount + duplicateCount + excludedCount;
   const filteredCount = preview.totalCount - totalCount;
 
   if (uniqueCount !== preview.uniqueCount) {
@@ -466,6 +501,12 @@ export function validatePreviewConsistency(
     throw new ServiceError(
       "PREVIEW_DUPLICATE_COUNT_MISMATCH",
       `预览重复数量不一致：声明 ${preview.duplicateCount}，实际 ${duplicateCount}。请重新生成预览。`
+    );
+  }
+  if (excludedCount !== preview.excludedCount) {
+    throw new ServiceError(
+      "PREVIEW_EXCLUDED_COUNT_MISMATCH",
+      `预览排除数量不一致：声明 ${preview.excludedCount}，实际 ${excludedCount}。请重新生成预览。`
     );
   }
   if (preview.estimatedMoveCount !== uniqueCount) {
@@ -485,7 +526,8 @@ export function validatePreviewConsistency(
     totalCount: preview.totalCount,
     uniqueCount,
     duplicateCount,
-    filteredCount
+    filteredCount,
+    excludedCount
   };
 }
 

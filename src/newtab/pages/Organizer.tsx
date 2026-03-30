@@ -219,6 +219,51 @@ export function OrganizerPage() {
   }
 
   /**
+   * 将排除项按建议路径重新纳入预览，便于用户手动覆盖默认排除策略。
+   */
+  function includeExcludedItem(index: number) {
+    setPreview((prev) => {
+      if (!prev) {
+        return prev;
+      }
+
+      const target = prev.excludedItems[index];
+      if (!target) {
+        return prev;
+      }
+
+      const nextExcludedItems = prev.excludedItems.filter((_, currentIndex) => currentIndex !== index);
+      const targetPath = target.suggestedGroupPath.length > 0 ? target.suggestedGroupPath : ["工作", "内部系统"];
+      const groups = [...prev.groups];
+      const existedIndex = groups.findIndex(
+        (group) => formatGroupPath(group.groupPath) === formatGroupPath(targetPath)
+      );
+
+      if (existedIndex >= 0) {
+        groups[existedIndex] = {
+          ...groups[existedIndex],
+          bookmarkIds: [...groups[existedIndex].bookmarkIds, target.id]
+        };
+      } else {
+        groups.push({
+          groupPath: targetPath,
+          bookmarkIds: [target.id],
+          reason: `排除项手动纳入：${target.reason}`
+        });
+      }
+
+      return {
+        ...prev,
+        uniqueCount: prev.uniqueCount + 1,
+        excludedCount: nextExcludedItems.length,
+        estimatedMoveCount: prev.estimatedMoveCount + 1,
+        groups,
+        excludedItems: nextExcludedItems
+      };
+    });
+  }
+
+  /**
    * 开始加载并记录当前动作。
    */
   function startLoading(action: LoadingAction, text: string) {
@@ -332,9 +377,41 @@ export function OrganizerPage() {
               <Badge>总数：{preview.totalCount}</Badge>
               <Badge variant="neutral">唯一：{preview.uniqueCount}</Badge>
               <Badge variant="neutral">重复：{preview.duplicateCount}</Badge>
+              <Badge variant="neutral">排除：{preview.excludedCount}</Badge>
               <Badge variant="neutral">预计移动：{preview.estimatedMoveCount}</Badge>
               <Badge variant="neutral">分组：{preview.groups.length}</Badge>
             </div>
+            {preview.excludedItems.length > 0 ? (
+              <div className="rounded-base border-2 border-border bg-secondary-background p-3 shadow-shadow">
+                <p className="text-sm font-semibold">已排除书签</p>
+                <p className="mt-1 text-xs">
+                  以下书签不会进入本轮 AI 分类，通常因为它们属于本地文件、内网地址或测试环境。
+                </p>
+                <ul className="mt-3 grid gap-2">
+                  {preview.excludedItems.map((item, index) => (
+                    <li
+                      key={item.id}
+                      className="rounded-base border-2 border-border bg-main/10 px-3 py-2 text-sm"
+                    >
+                      <p className="break-words font-medium">{item.title || "(无标题)"}</p>
+                      <p className="mt-1 break-all text-xs">{item.url}</p>
+                      <p className="mt-1 text-xs">原因：{item.reason}</p>
+                      <p className="mt-1 text-xs">
+                        建议归档：{formatGroupPath(item.suggestedGroupPath)}
+                      </p>
+                      <Button
+                        variant="neutral"
+                        className="mt-2"
+                        onClick={() => includeExcludedItem(index)}
+                        disabled={loading}
+                      >
+                        纳入建议分组
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
             <ul className="grid gap-3">
               {preview.groups.map((group, index) => (
                 <li

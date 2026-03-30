@@ -9,6 +9,7 @@ import {
 } from "./bookmark-service";
 import { ServiceError } from "../utils/service-error";
 import { deduplicateBookmarks } from "../utils/dedup";
+import { preprocessBookmarks } from "../utils/bookmark-preprocess";
 
 const SESSION_PREVIEW_KEY = "session:preview";
 
@@ -17,7 +18,8 @@ const SESSION_PREVIEW_KEY = "session:preview";
  */
 export async function generatePreview(folderId?: string): Promise<OrganizePreview> {
   const items = await listScopeBookmarks(folderId);
-  const dedupResult = deduplicateBookmarks(items);
+  const preprocessResult = preprocessBookmarks(items);
+  const dedupResult = deduplicateBookmarks(preprocessResult.includedItems);
   const config = await getConfig();
   if (!hasAiConfig(config)) {
     throw new ServiceError(
@@ -32,9 +34,11 @@ export async function generatePreview(folderId?: string): Promise<OrganizePrevie
     totalCount: items.length,
     uniqueCount: dedupResult.uniqueItems.length,
     duplicateCount: dedupResult.duplicateIds.length,
+    excludedCount: preprocessResult.excludedItems.length,
     estimatedMoveCount: dedupResult.uniqueItems.length,
     groups,
     duplicateIds: dedupResult.duplicateIds,
+    excludedItems: preprocessResult.excludedItems,
     source: "ai"
   };
   validatePreviewConsistency(preview);
